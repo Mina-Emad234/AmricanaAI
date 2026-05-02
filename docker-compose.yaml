@@ -1,0 +1,16 @@
+services:
+  rag-app:
+    build: .
+    container_name: americana_rag_bot
+    volumes:
+      - ./data:/app/data                
+      - ./chroma_db:/app/chroma_customer_support 
+      - ./models_cache:/root/.cache/huggingface 
+    
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+    
+    ports:
+      - "7860:7860"
+    
+    restart: always

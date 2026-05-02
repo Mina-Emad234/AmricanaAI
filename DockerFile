@@ -1,0 +1,30 @@
+# اختيار نسخة بايثون مناسبة
+FROM python:3.10-slim
+
+# تعيين مجلد العمل داخل الدوكر
+WORKDIR /app
+
+# تثبيت المكتبات الضرورية (المذكورة في الخطوة 2 من الدليل)
+RUN pip install --no-cache-dir \
+    langchain \
+    langchain-openai \
+    langchain-community \
+    langchain-chroma \
+    sentence-transformers \
+    gradio \
+    pypdf \
+    langchain-huggingface \
+    langchain-text-splitters \
+    chromadb \
+    python-dotenv \
+    requests==2.32.4 \
+    langchain-groq
+
+# نسخ ملفات المشروع إلى الحاوية
+COPY . .
+
+# فتح المنفذ الخاص بواجهة Gradio (الخطوة 7 من الدليل)
+EXPOSE 7860
+
+# تشغيل الكود
+CMD ["python", "app.py"]
