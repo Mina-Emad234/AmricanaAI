@@ -9,145 +9,173 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage, AIMessage
 
 import gradio as gr
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # --- Configuration --- #
-
 groq_api_key = os.environ.get("GROQ_API_KEY")
-if not groq_api_key:
-    raise ValueError("GROQ_API_KEY not found. Please set it as an environment variable or in a .env file.")
-
 PDF_PATH = "/app/data/Privacy-Policy-Ar.pdf"
 CHROMA_DIR = "/app/chroma_customer_support"
 
-# --- Document Loading and Splitting --- #
-
+# --- Document Loading and Processing --- #
 if not os.path.exists(PDF_PATH):
     print(f"Error: PDF file not found at {PDF_PATH}")
     exit(1)
 
-print(f"Loading PDF from: {PDF_PATH}")
 loader = PyPDFLoader(PDF_PATH)
 docs = loader.load()
-
-splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
+splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=120)
 chunks = splitter.split_documents(docs)
-print(f"Split PDF into {len(chunks)} chunks.")
 
-# --- Embeddings --- #
+# --- Vector Store Setup --- #
+if not groq_api_key:
+    raise ValueError("GROQ_API_KEY not found. Please set it as an environment variable or in a .env file.")
 
 print("Initializing embeddings model...")
 embeddings = HuggingFaceEmbeddings(model_name="intfloat/multilingual-e5-small")
 
-# --- Vector Store (ChromaDB) --- #
-# Always wipe and rebuild so the AI always uses the latest PDF
-
-# Clear contents inside the mounted volume directory (cannot delete the root mount itself)
+# Clear contents of Chroma directory safely (for Docker mounts)
 if os.path.exists(CHROMA_DIR):
     print(f"Clearing old Chroma DB contents at {CHROMA_DIR}...")
-    # Remove sqlite file
-    for f in glob.glob(os.path.join(CHROMA_DIR, "*.sqlite3")):
-        os.remove(f)
-    # Remove data subdirectories
     for item in os.listdir(CHROMA_DIR):
         item_path = os.path.join(CHROMA_DIR, item)
-        if os.path.isdir(item_path):
-            shutil.rmtree(item_path)
-    print("Old Chroma DB cleared.")
+        try:
+            if os.path.isfile(item_path) or os.path.islink(item_path):
+                os.unlink(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+        except Exception as e:
+            print(f"Failed to delete {item_path}. Reason: {e}")
 
+print("Building Chroma DB from PDF chunks...")
 os.makedirs(CHROMA_DIR, exist_ok=True)
-
-print("Building Chroma DB from PDF...")
 vectordb = Chroma.from_documents(
     documents=chunks,
     embedding=embeddings,
     persist_directory=CHROMA_DIR
 )
-print(f"Chroma DB built with {vectordb._collection.count()} documents.")
+print("Chroma DB built successfully.")
 
-# Set up the retriever
+print("Initializing retriever...")
 retriever = vectordb.as_retriever(
     search_type="mmr",
-    search_kwargs={"k": 6, "fetch_k": 20}
+    search_kwargs={"k": 5, "fetch_k": 20}
 )
-print("Retriever initialized.")
+print("Retriever ready.")
 
-# --- Language Model (LLM) Setup --- #
-
-def format_docs(docs):
-    return "\n\n".join(d.page_content for d in docs)
-
-print("Initializing ChatGroq LLM...")
+# --- LLM Setup --- #
 llm = ChatGroq(
-    temperature=0.2,
+    temperature=0.1, # Lower temperature for higher accuracy
     model_name="llama-3.1-8b-instant",
     groq_api_key=groq_api_key,
 )
 
-# System Prompt
-system_prompt = """
-You are a restaurant customer service assistant.
-Use only the information provided in the context below.
-If the information is missing, state that you do not know and suggest contacting human support.
-Language Policy: Automatically detect and match the user's language (e.g., Arabic, English, or any other language used).
-Keep responses short, clear, and professional.
-{context}
-"""
+# --- Prompts Engineering --- #
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_prompt),
-    ("human", "{question}")
+# 1. Contextualize Question Prompt
+# This makes the AI smart enough to understand pronouns like "it", "they", or "him" based on history.
+contextualize_q_system_prompt = (
+    "Given a chat history and the latest user question "
+    "which might reference context in the chat history, "
+    "formulate a standalone question which can be understood "
+    "without the chat history. Do NOT answer the question, "
+    "just reformulate it if needed and otherwise return it as is."
+)
+
+contextualize_q_prompt = ChatPromptTemplate.from_messages([
+    ("system", contextualize_q_system_prompt),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}"),
 ])
 
-# RAG Chain
-rag_chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    | prompt
-    | llm
+contextualize_q_chain = contextualize_q_prompt | llm | StrOutputParser()
+
+# 2. Main QA Prompt
+system_prompt = (
+    "You are a highly intelligent customer service assistant for Americana Restaurant."
+    "\n\n"
+    "GUIDELINES:"
+    "1. Use the following pieces of retrieved context to answer the question."
+    "2. If the answer is not in the context, politely state that you don't have this information "
+    "and suggest contacting Americana customer support at 12345."
+    "3. Language: Always respond in the SAME language used by the user (Arabic or English)."
+    "4. Tone: Professional, friendly, and concise. Use emojis where appropriate."
+    "\n\n"
+    "CONTEXT:"
+    "{context}"
 )
-print("RAG chain assembled successfully.")
+
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}"),
+])
+
+# --- Core Logic --- #
+
+def format_docs(docs):
+    return "\n\n".join(d.page_content for d in docs)
+
+def get_response(user_input, chat_history):
+    # Step 1: Create a standalone question
+    history_langchain = []
+    for entry in chat_history:
+        if isinstance(entry, dict):
+            # Gradio 5.x / Message format
+            role = entry.get("role")
+            content = entry.get("content")
+            if role == "user":
+                history_langchain.append(HumanMessage(content=content))
+            else:
+                history_langchain.append(AIMessage(content=content))
+        elif isinstance(entry, (list, tuple)):
+            # Gradio 3.x/4.x / Tuple format
+            if len(entry) == 2:
+                human, ai = entry
+                history_langchain.append(HumanMessage(content=human))
+                history_langchain.append(AIMessage(content=ai))
+
+    if history_langchain:
+        standalone_question = contextualize_q_chain.invoke({
+            "chat_history": history_langchain,
+            "question": user_input
+        })
+    else:
+        standalone_question = user_input
+
+    # Step 2: Retrieve relevant documents
+    docs = retriever.invoke(standalone_question)
+    formatted_context = format_docs(docs)
+
+    # Step 3: Generate final answer
+    full_chain = qa_prompt | llm
+    response = full_chain.invoke({
+        "context": formatted_context,
+        "question": standalone_question,
+        "chat_history": history_langchain
+    })
+    
+    return response.content
 
 # --- Gradio Interface --- #
 
-def respond(message, chat_history):
-    if not message or not message.strip():
-        return chat_history, ""
+def chat_wrapper(message, history):
+    bot_reply = get_response(message, history)
+    yield bot_reply # Using yield for better integration with Gradio's chat flow
 
-    try:
-        response = rag_chain.invoke(message)
-        bot_reply = response.content
-    except Exception as e:
-        bot_reply = f"Sorry, an error occurred: {str(e)}"
-
-    if chat_history is None:
-        chat_history = []
-
-    chat_history.append({"role": "user", "content": message})
-    chat_history.append({"role": "assistant", "content": bot_reply})
-
-    return chat_history, ""
-
-print("Launching Gradio interface...")
-with gr.Blocks() as demo:
-    gr.Markdown("## Amrecana Restaurant Smart Customer Service (RAG Bot)")
-
-    chatbot = gr.Chatbot(label="Customer Service AI Assistant")
-
-    msg = gr.Textbox(
-        placeholder="اكتب استفسارك هنا...",
-        label="رسالتك"
-    )
-
-    clear = gr.Button("مسح الدردشة")
-
-    msg.submit(respond, [msg, chatbot], [chatbot, msg])
-    clear.click(lambda: ([], ""), None, [chatbot, msg])
+demo = gr.ChatInterface(
+    fn=chat_wrapper,
+    title="Americana Smart Support AI",
+    description="Ask me anything about our policies and services!",
+    examples=["What is the privacy policy?", "How do you handle my data?"]
+)
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
